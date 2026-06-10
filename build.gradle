@@ -3,13 +3,20 @@ plugins {
 }
 
 repositories {
+
 	mavenLocal()
+
 	maven {
 		url = 'https://repo.runelite.net'
 		content {
 			includeGroupByRegex("net\\.runelite.*")
 		}
 	}
+
+	maven {
+		url 'https://jitpack.io'
+	}
+
 	mavenCentral()
 }
 
@@ -17,6 +24,7 @@ def runeLiteVersion = 'latest.release'
 def pluginMainClass = 'com.example.ExamplePluginTest'
 
 dependencies {
+	implementation 'com.github.LogicismDev:OpenRGB4J:v1.1'
 	compileOnly group: 'net.runelite', name:'client', version: runeLiteVersion
 
 	compileOnly 'org.projectlombok:lombok:1.18.30'
