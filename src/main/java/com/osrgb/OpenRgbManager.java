@@ -1,4 +1,4 @@
-package com.example;
+package com.osrgb;
 
 import lombok.extern.slf4j.Slf4j;
 

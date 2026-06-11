@@ -1,4 +1,4 @@
-package com.example;
+package com.osrgb;
 
 import me.Logicism.OpenRGB4J.OpenRGBClient;
 

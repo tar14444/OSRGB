@@ -21,7 +21,7 @@ repositories {
 }
 
 def runeLiteVersion = 'latest.release'
-def pluginMainClass = 'com.example.ExamplePluginTest'
+def pluginMainClass = 'com.osrgb.OsrgbPluginTest'
 
 dependencies {
 	implementation 'com.github.LogicismDev:OpenRGB4J:v1.1'
