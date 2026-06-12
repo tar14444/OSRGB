@@ -19,14 +19,14 @@ import java.util.List;
 @Slf4j
 public class OpenRgbDirectClient implements Closeable
 {
-    private static final String HOST = "127.0.0.1";
-    private static final int PORT = 6742;
-
     private static final int REQUEST_CONTROLLER_COUNT = 0;
     private static final int REQUEST_CONTROLLER_DATA = 1;
     private static final int SET_CLIENT_NAME = 50;
     private static final int UPDATE_LEDS = 1050;
     private static final int SET_CUSTOM_MODE = 1100;
+
+    private String host = "127.0.0.1";
+    private int port = 6742;
 
     private Socket socket;
     private DataInputStream input;
@@ -36,8 +36,17 @@ public class OpenRgbDirectClient implements Closeable
     private final List<DeviceInfo> devices = new ArrayList<>();
 
     private Color lastSentColor = null;
-    private long packetsSent = 0;
-    private long lastStatsLogTime = 0;
+
+    public synchronized void configure(String host, int port)
+    {
+        this.host = host == null || host.trim().isEmpty()
+                ? "127.0.0.1"
+                : host.trim();
+
+        this.port = Math.max(1, Math.min(65535, port));
+
+        disconnect();
+    }
 
     public synchronized boolean connect()
     {
@@ -48,10 +57,8 @@ public class OpenRgbDirectClient implements Closeable
 
         try
         {
-            log.info("Connecting to OpenRGB SDK server at {}:{}", HOST, PORT);
-
             socket = new Socket();
-            socket.connect(new InetSocketAddress(HOST, PORT), 1500);
+            socket.connect(new InetSocketAddress(host, port), 1500);
             socket.setSoTimeout(3000);
 
             input = new DataInputStream(socket.getInputStream());
@@ -63,8 +70,6 @@ public class OpenRgbDirectClient implements Closeable
 
             devices.clear();
 
-            log.info("OpenRGB controller count: {}", count);
-
             for (int i = 0; i < count; i++)
             {
                 DeviceInfo device = requestDeviceInfo(i);
@@ -72,28 +77,17 @@ public class OpenRgbDirectClient implements Closeable
                 if (device.ledCount > 0)
                 {
                     devices.add(device);
-
-                    log.info(
-                            "OpenRGB device {}: {} LEDs={}",
-                            device.deviceIndex,
-                            device.name,
-                            device.ledCount
-                    );
-
                     setCustomMode(device.deviceIndex);
                 }
             }
 
             connected = true;
-            lastStatsLogTime = System.currentTimeMillis();
-
-            log.info("OpenRGB direct connection established. Usable devices: {}", devices.size());
 
             return true;
         }
         catch (Exception e)
         {
-            log.error("Failed to connect directly to OpenRGB SDK server", e);
+            log.error("Failed to connect to OpenRGB SDK server", e);
             disconnect();
             return false;
         }
@@ -101,11 +95,6 @@ public class OpenRgbDirectClient implements Closeable
 
     public synchronized void disconnect()
     {
-        if (connected)
-        {
-            log.info("OpenRGB direct disconnected");
-        }
-
         connected = false;
         devices.clear();
 
@@ -172,37 +161,17 @@ public class OpenRgbDirectClient implements Closeable
 
         try
         {
-            log.info(
-                    "OpenRGB direct color{} -> R:{} G:{} B:{}",
-                    force ? " FORCE" : "",
-                    color.getRed(),
-                    color.getGreen(),
-                    color.getBlue()
-            );
-
             for (DeviceInfo device : devices)
             {
                 updateDeviceLeds(device.deviceIndex, device.ledCount, color);
             }
 
             lastSentColor = color;
-            logStatsOccasionally();
         }
         catch (Exception e)
         {
-            log.error("Failed to set OpenRGB color directly", e);
+            log.error("Failed to set OpenRGB color", e);
             disconnect();
-        }
-    }
-
-    private void logStatsOccasionally()
-    {
-        long now = System.currentTimeMillis();
-
-        if (now - lastStatsLogTime >= 300000)
-        {
-            log.info("OpenRGB packets sent: {}", packetsSent);
-            lastStatsLogTime = now;
         }
     }
 
@@ -240,7 +209,7 @@ public class OpenRgbDirectClient implements Closeable
 
         if (packet.packetId != REQUEST_CONTROLLER_DATA)
         {
-            throw new IOException("Invalid controller data response for device " + deviceIndex);
+            throw new IOException("Invalid controller data response");
         }
 
         return parseDeviceInfo(deviceIndex, packet.data);
@@ -284,7 +253,6 @@ public class OpenRgbDirectClient implements Closeable
         }
 
         int colorCount = reader.readUShort();
-
         reader.skip(colorCount * 4);
 
         return new DeviceInfo(deviceIndex, name, ledCount);
@@ -352,7 +320,6 @@ public class OpenRgbDirectClient implements Closeable
         }
 
         sendPacket(deviceIndex, UPDATE_LEDS, body.toByteArray());
-        packetsSent++;
     }
 
     private void sendPacket(int deviceIndex, int packetId, byte[] data) throws IOException

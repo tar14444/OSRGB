@@ -12,44 +12,73 @@ import java.awt.Color;
 public interface OsrgbConfig extends Config
 {
 	@ConfigSection(
+			name = "OpenRGB Connection",
+			description = "OpenRGB SDK connection settings",
+			position = 0
+	)
+	String connectionSection = "connectionSection";
+	@ConfigItem(
+			keyName = "openRgbHost",
+			name = "OpenRGB Host",
+			description = "OpenRGB SDK server hostname or IP",
+			section = connectionSection,
+			position = 0
+	)
+	default String openRgbHost()
+	{
+		return "127.0.0.1";
+	}
+
+	@ConfigItem(
+			keyName = "openRgbPort",
+			name = "OpenRGB Port",
+			description = "OpenRGB SDK server port",
+			section = connectionSection,
+			position = 1
+	)
+	default int openRgbPort()
+	{
+		return 6742;
+	}
+	@ConfigSection(
 			name = "Enable Settings",
 			description = "Toggle OSRGB features",
-			position = 0
+			position = 1
 	)
 	String enableSection = "enableSection";
 
 	@ConfigSection(
 			name = "HP Colors",
 			description = "Customize HP colors and thresholds",
-			position = 1
+			position = 2
 	)
 	String hpSection = "hpSection";
 
 	@ConfigSection(
 			name = "Effect Colors",
 			description = "Customize RGB effect colors",
-			position = 2
+			position = 3
 	)
 	String colorSection = "colorSection";
 
 	@ConfigSection(
 			name = "Effect Styles",
 			description = "Choose animation styles for effects",
-			position = 3
+			position = 4
 	)
 	String styleSection = "styleSection";
 
 	@ConfigSection(
 			name = "Valuable Drops",
 			description = "Valuable drop settings",
-			position = 4
+			position = 5
 	)
 	String dropSection = "dropSection";
 
 	@ConfigSection(
 			name = "Test Effects",
 			description = "Trigger test RGB effects",
-			position = 5
+			position = 6
 	)
 	String testSection = "testSection";
 
