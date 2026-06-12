@@ -5,25 +5,18 @@ import javax.inject.Inject;
 
 import lombok.extern.slf4j.Slf4j;
 
-import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.Skill;
-import net.runelite.api.VarPlayer;
-import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.StatChanged;
 
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
-import net.runelite.client.events.NpcLootReceived;
-import net.runelite.client.game.ItemManager;
-import net.runelite.client.game.ItemStack;
 import net.runelite.client.plugins.PluginDescriptor;
 
 import java.awt.Color;
-import java.util.EnumMap;
-import java.util.Map;
+import java.util.Random;
 
 @Slf4j
 @PluginDescriptor(
@@ -37,101 +30,41 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 	@Inject
 	private OsrgbConfig config;
 
-	@Inject
-	private ConfigManager configManager;
+	private final OpenRgbDirectClient rgb = new OpenRgbDirectClient();
+	private final Random random = new Random();
 
-	@Inject
-	private ItemManager itemManager;
-
-	private final RgbHttpClient rgb = new RgbHttpClient();
-
-	private Process pythonServer;
-	private Thread shutdownHook;
-
-	private String lastAilment = "NONE";
 	private int lastHp = -1;
 	private int lastMaxHp = -1;
-	private boolean lastCriticalMode = false;
+	private Color lastColor = null;
 
-	private final Map<Skill, Integer> lastSkillLevels =
-			new EnumMap<>(Skill.class);
+	private volatile boolean criticalActive = false;
+	private Thread criticalThread;
 
 	@Override
-	protected void startUp() throws Exception
+	protected void startUp()
 	{
-		log.info("OSRGB Started");
+		log.info("OSRGB Direct Started");
 
-		String helperPath =
-				System.getenv("LOCALAPPDATA")
-						+ "\\OSRGB\\Helper\\OSRGB-Helper.exe";
+		rgb.connect();
 
-		pythonServer = new ProcessBuilder(helperPath).start();
-
-		shutdownHook = new Thread(this::killPythonServer, "OSRGB-Shutdown-Hook");
-		Runtime.getRuntime().addShutdownHook(shutdownHook);
-
-		lastSkillLevels.clear();
-
-		log.info("OSRGB Python server started");
+		lastHp = -1;
+		lastMaxHp = -1;
+		lastColor = null;
+		criticalActive = false;
 	}
 
 	@Override
 	protected void shutDown()
 	{
-		log.info("OSRGB Stopped");
+		log.info("OSRGB Direct Stopped");
 
-		if (shutdownHook != null)
-		{
-			try
-			{
-				Runtime.getRuntime().removeShutdownHook(shutdownHook);
-			}
-			catch (Exception ignored)
-			{
-			}
+		stopCriticalEffectAndWait();
 
-			shutdownHook = null;
-		}
+		rgb.close();
 
-		killPythonServer();
-	}
-
-	private void killPythonServer()
-	{
-		if (pythonServer == null)
-		{
-			return;
-		}
-
-		try
-		{
-			long pid = pythonServer.pid();
-
-			new ProcessBuilder(
-					"taskkill",
-					"/F",
-					"/T",
-					"/PID",
-					String.valueOf(pid)
-			).start().waitFor();
-
-			log.info("Killed OSRGB Python server PID {}", pid);
-		}
-		catch (Exception e)
-		{
-			log.error("Failed to kill Python server by PID", e);
-
-			try
-			{
-				pythonServer.descendants().forEach(ProcessHandle::destroyForcibly);
-				pythonServer.destroyForcibly();
-			}
-			catch (Exception ignored)
-			{
-			}
-		}
-
-		pythonServer = null;
+		lastHp = -1;
+		lastMaxHp = -1;
+		lastColor = null;
 	}
 
 	@Subscribe
@@ -142,358 +75,346 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 			return;
 		}
 
+		log.info("OSRGB config changed, forcing direct color refresh");
+
 		lastHp = -1;
 		lastMaxHp = -1;
-		lastCriticalMode = false;
+		lastColor = null;
 
-		int hp = client.getBoostedSkillLevel(Skill.HITPOINTS);
-		int maxHp = client.getRealSkillLevel(Skill.HITPOINTS);
-
-		if (maxHp <= 0)
-		{
-			return;
-		}
-
-		double percent = (double) hp / maxHp;
-		Color hpColor = getHpColor(percent);
-
-		boolean criticalPulseEnabled =
-				config.enableCriticalPulse() && hp <= config.criticalHpValue();
-
-		double sentPercent = criticalPulseEnabled ? 0.0 : 1.0;
-
-		rgb.sendColor(
-				hpColor,
-				sentPercent,
-				config.criticalStyle(),
-				config.criticalHpColor(),
-				darken(config.criticalHpColor(), 0.15)
-		);
-
-		lastCriticalMode = criticalPulseEnabled;
-	}
-
-	@Subscribe
-	public void onGameTick(GameTick tick)
-	{
-		int hp = client.getBoostedSkillLevel(Skill.HITPOINTS);
-		int maxHp = client.getRealSkillLevel(Skill.HITPOINTS);
-
-		if (maxHp <= 0)
-		{
-			return;
-		}
-
-		double percent = (double) hp / maxHp;
-		Color hpColor = getHpColor(percent);
-
-		handleTestOptions(percent, hpColor);
-		handleAilments(percent, hpColor);
-		handleHpColors(hp, maxHp, percent, hpColor);
+		sendCurrentHpColor(true);
 	}
 
 	@Subscribe
 	public void onStatChanged(StatChanged event)
 	{
-		if (!config.enableLevelUpFlash())
+		if (event.getSkill() != Skill.HITPOINTS)
 		{
 			return;
 		}
 
-		Skill skill = event.getSkill();
-		int newLevel = event.getLevel();
-
-		Integer oldLevel = lastSkillLevels.get(skill);
-
-		lastSkillLevels.put(skill, newLevel);
-
-		if (oldLevel == null)
-		{
-			return;
-		}
-
-		if (newLevel > oldLevel)
-		{
-			sendSimpleEffect("level_up", config.levelUpStyle());
-		}
+		sendCurrentHpColor(true);
 	}
 
 	@Subscribe
-	public void onNpcLootReceived(NpcLootReceived event)
+	public void onGameTick(GameTick tick)
 	{
-		if (!config.enableValuableDropFlash())
-		{
-			return;
-		}
-
-		int threshold = Math.max(1000, config.valuableDropThreshold());
-
-		for (ItemStack item : event.getItems())
-		{
-			int itemId = itemManager.canonicalize(item.getId());
-			int quantity = Math.max(1, item.getQuantity());
-			int price = itemManager.getItemPrice(itemId);
-
-			long totalValue = (long) price * quantity;
-
-			if (totalValue >= threshold)
-			{
-				sendColoredEffect(
-						"valuable_drop",
-						config.valuableDropColor(),
-						darken(config.valuableDropColor(), 0.25),
-						config.valuableDropStyle()
-				);
-
-				return;
-			}
-		}
+		sendCurrentHpColor(false);
 	}
 
-	@Subscribe
-	public void onChatMessage(ChatMessage event)
-	{
-		if (event.getType() != ChatMessageType.GAMEMESSAGE)
-		{
-			return;
-		}
-
-		String message = cleanMessage(event.getMessage());
-
-		if (
-				config.enableCombatAchievementFlash()
-						&& (
-						message.contains("combat achievement completed")
-								|| message.contains("combat achievements completed")
-								|| message.contains("you have completed a combat achievement")
-				)
-		)
-		{
-			sendColoredEffect(
-					"combat_achievement",
-					config.combatAchievementPrimaryColor(),
-					config.combatAchievementSecondaryColor(),
-					config.combatAchievementStyle()
-			);
-		}
-
-		if (
-				config.enableDeathFlash()
-						&& (
-						message.contains("oh dear, you are dead")
-								|| message.contains("you have died")
-								|| message.contains("you are dead")
-				)
-		)
-		{
-			sendColoredEffect(
-					"death",
-					config.deathPrimaryColor(),
-					config.deathSecondaryColor(),
-					config.deathStyle()
-			);
-		}
-
-		if (
-				config.enableCollectionLogFlash()
-						&& (
-						message.contains("new item added to your collection log")
-								|| message.contains("added to your collection log")
-				)
-		)
-		{
-			sendColoredEffect(
-					"collection_log",
-					config.collectionLogPrimaryColor(),
-					config.collectionLogSecondaryColor(),
-					config.collectionLogStyle()
-			);
-		}
-
-		if (
-				config.enableQuestFlash()
-						&& (
-						message.contains("quest complete")
-								|| message.contains("miniquest complete")
-								|| message.contains("achievement diary")
-								|| message.contains("diary task complete")
-								|| message.contains("you have completed the")
-				)
-						&& !message.contains("combat achievement")
-		)
-		{
-			sendColoredEffect(
-					"quest_complete",
-					config.questPrimaryColor(),
-					config.questSecondaryColor(),
-					config.questStyle()
-			);
-		}
-	}
-
-	private void handleTestOptions(double percent, Color hpColor)
-	{
-		double safePercent = Math.max(percent, getCriticalThresholdDecimal() + 0.01);
-
-		if (config.testPoisonFlash())
-		{
-			rgb.sendEffect("poison", hpColor, safePercent, config.poisonColor(), darken(config.poisonColor(), 0.25), config.poisonStyle());
-			configManager.setConfiguration("osrgb", "testPoisonFlash", false);
-		}
-
-		if (config.testVenomFlash())
-		{
-			rgb.sendEffect("venom", hpColor, safePercent, config.venomColor(), darken(config.venomColor(), 0.25), config.venomStyle());
-			configManager.setConfiguration("osrgb", "testVenomFlash", false);
-		}
-
-		if (config.testCriticalPulse())
-		{
-			rgb.sendEffect("critical_test", hpColor, safePercent, config.criticalHpColor(), darken(config.criticalHpColor(), 0.15), config.criticalStyle());
-			configManager.setConfiguration("osrgb", "testCriticalPulse", false);
-		}
-
-		if (config.testLevelUpFlash())
-		{
-			rgb.sendEffect("level_up", hpColor, safePercent, config.levelUpStyle());
-			configManager.setConfiguration("osrgb", "testLevelUpFlash", false);
-		}
-
-		if (config.testCombatAchievementFlash())
-		{
-			rgb.sendEffect("combat_achievement", hpColor, safePercent, config.combatAchievementPrimaryColor(), config.combatAchievementSecondaryColor(), config.combatAchievementStyle());
-			configManager.setConfiguration("osrgb", "testCombatAchievementFlash", false);
-		}
-
-		if (config.testValuableDropFlash())
-		{
-			rgb.sendEffect("valuable_drop", hpColor, safePercent, config.valuableDropColor(), darken(config.valuableDropColor(), 0.25), config.valuableDropStyle());
-			configManager.setConfiguration("osrgb", "testValuableDropFlash", false);
-		}
-
-		if (config.testDeathFlash())
-		{
-			rgb.sendEffect("death", hpColor, safePercent, config.deathPrimaryColor(), config.deathSecondaryColor(), config.deathStyle());
-			configManager.setConfiguration("osrgb", "testDeathFlash", false);
-		}
-
-		if (config.testCollectionLogFlash())
-		{
-			rgb.sendEffect("collection_log", hpColor, safePercent, config.collectionLogPrimaryColor(), config.collectionLogSecondaryColor(), config.collectionLogStyle());
-			configManager.setConfiguration("osrgb", "testCollectionLogFlash", false);
-		}
-
-		if (config.testQuestFlash())
-		{
-			rgb.sendEffect("quest_complete", hpColor, safePercent, config.questPrimaryColor(), config.questSecondaryColor(), config.questStyle());
-			configManager.setConfiguration("osrgb", "testQuestFlash", false);
-		}
-	}
-
-	private void handleAilments(double percent, Color hpColor)
-	{
-		String ailment = getAilment();
-
-		if (!ailment.equals(lastAilment))
-		{
-			if (config.enablePoisonFlash() && ailment.equals("POISON") && percent > getCriticalThresholdDecimal())
-			{
-				rgb.sendEffect("poison", hpColor, percent, config.poisonColor(), darken(config.poisonColor(), 0.25), config.poisonStyle());
-			}
-			else if (config.enableVenomFlash() && ailment.equals("VENOM") && percent > getCriticalThresholdDecimal())
-			{
-				rgb.sendEffect("venom", hpColor, percent, config.venomColor(), darken(config.venomColor(), 0.25), config.venomStyle());
-			}
-
-			lastAilment = ailment;
-		}
-	}
-
-	private void handleHpColors(int hp, int maxHp, double percent, Color hpColor)
-	{
-		boolean criticalPulseEnabled =
-				config.enableCriticalPulse() && hp <= config.criticalHpValue();
-
-		if (!config.enableHpColors() && !criticalPulseEnabled)
-		{
-			return;
-		}
-
-		boolean shouldSend =
-				hp != lastHp
-						|| maxHp != lastMaxHp
-						|| criticalPulseEnabled != lastCriticalMode;
-
-		if (shouldSend)
-		{
-			double sentPercent = criticalPulseEnabled ? 0.0 : 1.0;
-
-			rgb.sendColor(
-					hpColor,
-					sentPercent,
-					config.criticalStyle(),
-					config.criticalHpColor(),
-					darken(config.criticalHpColor(), 0.15)
-			);
-
-			lastHp = hp;
-			lastMaxHp = maxHp;
-			lastCriticalMode = criticalPulseEnabled;
-		}
-	}
-
-	private void sendSimpleEffect(String effectName, EffectStyle style)
-	{
-		double percent = getCurrentHpPercent();
-		Color hpColor = getHpColor(percent);
-
-		rgb.sendEffect(
-				effectName,
-				hpColor,
-				Math.max(percent, getCriticalThresholdDecimal() + 0.01),
-				style
-		);
-	}
-
-	private void sendColoredEffect(String effectName, Color primary, Color secondary, EffectStyle style)
-	{
-		double percent = getCurrentHpPercent();
-		Color hpColor = getHpColor(percent);
-
-		rgb.sendEffect(
-				effectName,
-				hpColor,
-				Math.max(percent, getCriticalThresholdDecimal() + 0.01),
-				primary,
-				secondary,
-				style
-		);
-	}
-
-	private String cleanMessage(String message)
-	{
-		return message
-				.replaceAll("<[^>]*>", "")
-				.toLowerCase();
-	}
-
-	private double getCurrentHpPercent()
+	private void sendCurrentHpColor(boolean force)
 	{
 		int hp = client.getBoostedSkillLevel(Skill.HITPOINTS);
 		int maxHp = client.getRealSkillLevel(Skill.HITPOINTS);
 
 		if (maxHp <= 0)
 		{
-			return 1.0;
+			return;
 		}
 
-		return (double) hp / maxHp;
+		boolean shouldCritical =
+				config.enableCriticalPulse() && hp <= config.criticalHpValue();
+
+		if (shouldCritical)
+		{
+			startCriticalEffect();
+
+			lastHp = hp;
+			lastMaxHp = maxHp;
+			return;
+		}
+
+		if (criticalActive)
+		{
+			stopCriticalEffectAndWait();
+
+			lastHp = -1;
+			lastMaxHp = -1;
+			lastColor = null;
+			force = true;
+		}
+
+		Color hpColor = getHpColor(hp);
+
+		if (
+				!force
+						&& hp == lastHp
+						&& maxHp == lastMaxHp
+						&& lastColor != null
+						&& lastColor.equals(hpColor)
+		)
+		{
+			return;
+		}
+
+		log.info(
+				"OSRGB Direct HP Color{}: {} / {} -> R:{} G:{} B:{}",
+				force ? " FORCE" : "",
+				hp,
+				maxHp,
+				hpColor.getRed(),
+				hpColor.getGreen(),
+				hpColor.getBlue()
+		);
+
+		if (force)
+		{
+			rgb.forceSetAllDevices(hpColor);
+		}
+		else
+		{
+			rgb.setAllDevices(hpColor);
+		}
+
+		lastHp = hp;
+		lastMaxHp = maxHp;
+		lastColor = hpColor;
 	}
 
-	private Color getHpColor(double percent)
+	private void startCriticalEffect()
 	{
-		int hp = client.getBoostedSkillLevel(Skill.HITPOINTS);
+		if (criticalActive)
+		{
+			return;
+		}
 
+		log.info("OSRGB critical effect started");
+
+		criticalActive = true;
+
+		criticalThread = new Thread(this::criticalLoop, "OSRGB-Critical-Effect");
+		criticalThread.setDaemon(true);
+		criticalThread.start();
+	}
+
+	private void stopCriticalEffectAndWait()
+	{
+		if (!criticalActive)
+		{
+			return;
+		}
+
+		log.info("OSRGB critical effect stopping");
+
+		criticalActive = false;
+
+		Thread thread = criticalThread;
+
+		if (thread != null)
+		{
+			try
+			{
+				thread.interrupt();
+				thread.join(500);
+			}
+			catch (Exception ignored)
+			{
+			}
+		}
+
+		criticalThread = null;
+
+		log.info("OSRGB critical effect stopped");
+	}
+
+	private void criticalLoop()
+	{
+		while (criticalActive)
+		{
+			try
+			{
+				runCriticalStep();
+			}
+			catch (InterruptedException e)
+			{
+				return;
+			}
+			catch (Exception e)
+			{
+				log.error("Critical effect error", e);
+				return;
+			}
+		}
+	}
+
+	private void runCriticalStep() throws InterruptedException
+	{
+		Color primary = config.criticalHpColor();
+		Color secondary = darken(primary, 0.15);
+
+		switch (config.criticalStyle())
+		{
+			case FLASH:
+				if (!criticalActive)
+				{
+					return;
+				}
+
+				rgb.forceSetAllDevices(primary);
+				sleepCritical(300);
+
+				if (!criticalActive)
+				{
+					return;
+				}
+
+				rgb.forceSetAllDevices(secondary);
+				sleepCritical(700);
+				break;
+
+			case PULSE:
+				for (int i = 0; i < 10 && criticalActive; i++)
+				{
+					rgb.forceSetAllDevices(blend(secondary, primary, i / 9.0));
+					sleepCritical(35);
+				}
+
+				for (int i = 0; i < 10 && criticalActive; i++)
+				{
+					rgb.forceSetAllDevices(blend(primary, secondary, i / 9.0));
+					sleepCritical(35);
+				}
+				break;
+
+			case STROBE:
+				if (!criticalActive)
+				{
+					return;
+				}
+
+				rgb.forceSetAllDevices(primary);
+				sleepCritical(80);
+
+				if (!criticalActive)
+				{
+					return;
+				}
+
+				rgb.forceSetAllDevices(secondary);
+				sleepCritical(80);
+				break;
+
+			case BREATHING:
+				for (int i = 0; i < 20 && criticalActive; i++)
+				{
+					rgb.forceSetAllDevices(blend(secondary, primary, i / 19.0));
+					sleepCritical(40);
+				}
+
+				for (int i = 0; i < 20 && criticalActive; i++)
+				{
+					rgb.forceSetAllDevices(blend(primary, secondary, i / 19.0));
+					sleepCritical(40);
+				}
+				break;
+
+			case RAINBOW:
+				Color[] rainbow = new Color[]
+						{
+								new Color(255, 0, 0),
+								new Color(255, 128, 0),
+								new Color(255, 255, 0),
+								new Color(0, 255, 0),
+								new Color(0, 255, 255),
+								new Color(0, 80, 255),
+								new Color(170, 0, 255)
+						};
+
+				for (Color color : rainbow)
+				{
+					if (!criticalActive)
+					{
+						break;
+					}
+
+					rgb.forceSetAllDevices(color);
+					sleepCritical(120);
+				}
+				break;
+
+			case FIRE:
+				Color[] fire = new Color[]
+						{
+								primary,
+								secondary,
+								new Color(255, 80, 0),
+								new Color(255, 150, 0),
+								new Color(255, 220, 40),
+								darken(primary, 0.35)
+						};
+
+				if (!criticalActive)
+				{
+					return;
+				}
+
+				rgb.forceSetAllDevices(fire[random.nextInt(fire.length)]);
+				sleepCritical(40 + random.nextInt(90));
+				break;
+
+			case LIGHTNING:
+				if (!criticalActive)
+				{
+					return;
+				}
+
+				rgb.forceSetAllDevices(secondary);
+				sleepCritical(50 + random.nextInt(140));
+
+				if (random.nextDouble() < 0.45 && criticalActive)
+				{
+					rgb.forceSetAllDevices(Color.WHITE);
+					sleepCritical(40);
+
+					if (!criticalActive)
+					{
+						return;
+					}
+
+					rgb.forceSetAllDevices(primary);
+					sleepCritical(50);
+
+					if (!criticalActive)
+					{
+						return;
+					}
+
+					rgb.forceSetAllDevices(Color.WHITE);
+					sleepCritical(30);
+				}
+				break;
+
+			default:
+				if (!criticalActive)
+				{
+					return;
+				}
+
+				rgb.forceSetAllDevices(primary);
+				sleepCritical(300);
+
+				if (!criticalActive)
+				{
+					return;
+				}
+
+				rgb.forceSetAllDevices(secondary);
+				sleepCritical(700);
+				break;
+		}
+	}
+
+	private void sleepCritical(long millis) throws InterruptedException
+	{
+		long end = System.currentTimeMillis() + millis;
+
+		while (criticalActive && System.currentTimeMillis() < end)
+		{
+			Thread.sleep(Math.min(25, end - System.currentTimeMillis()));
+		}
+	}
+
+	private Color getHpColor(int hp)
+	{
 		int high = clamp(config.highHpValue(), 1, 999);
 		int medium = clamp(config.mediumHpValue(), 1, 999);
 		int low = clamp(config.lowHpValue(), 1, 999);
@@ -542,20 +463,6 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 		return config.criticalHpColor();
 	}
 
-	private double getCriticalThresholdDecimal()
-	{
-		int maxHp = client.getRealSkillLevel(Skill.HITPOINTS);
-
-		if (maxHp <= 0)
-		{
-			return 0.10;
-		}
-
-		int criticalHp = clamp(config.criticalHpValue(), 1, 999);
-
-		return (double) criticalHp / maxHp;
-	}
-
 	private double normalize(double value, double min, double max)
 	{
 		if (max <= min)
@@ -591,23 +498,6 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 	private int clamp(int value, int min, int max)
 	{
 		return Math.max(min, Math.min(max, value));
-	}
-
-	private String getAilment()
-	{
-		int poisonValue = client.getVarpValue(VarPlayer.POISON);
-
-		if (poisonValue >= 1000000)
-		{
-			return "VENOM";
-		}
-
-		if (poisonValue > 0)
-		{
-			return "POISON";
-		}
-
-		return "NONE";
 	}
 
 	@Provides
