@@ -8,5 +8,8 @@ public enum EffectStyle
     BREATHING,
     RAINBOW,
     FIRE,
-    LIGHTNING
+    LIGHTNING,
+    PANIC,
+    LOOT_SHOWER,
+    GRIM_REAPER
 }

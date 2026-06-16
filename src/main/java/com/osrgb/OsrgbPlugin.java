@@ -58,6 +58,9 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 	private volatile boolean effectActive = false;
 	private Thread effectThread;
 
+	private volatile boolean overlayActive = false;
+	private Thread overlayThread;
+
 	private volatile boolean deathActive = false;
 	private Thread deathThread;
 
@@ -77,6 +80,7 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 
 		criticalActive = false;
 		effectActive = false;
+		overlayActive = false;
 		deathActive = false;
 
 		lastSkillLevels.clear();
@@ -87,6 +91,7 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 	{
 		stopCriticalEffectAndWait();
 		stopCurrentEffectAndWait();
+		stopOverlayEffectAndWait();
 		stopDeathEffectAndWait();
 
 		rgb.close();
@@ -108,6 +113,7 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 		{
 			stopCriticalEffectAndWait();
 			stopCurrentEffectAndWait();
+			stopOverlayEffectAndWait();
 			stopDeathEffectAndWait();
 
 			rgb.configure(config.openRgbHost(), config.openRgbPort());
@@ -213,9 +219,10 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 		if (
 				config.enableCombatAchievementFlash()
 						&& (
-						message.contains("combat achievement completed")
-								|| message.contains("combat achievements completed")
-								|| message.contains("you have completed a combat achievement")
+						message.contains("ca_id:")
+								|| message.contains("combat task")
+								|| message.contains("combat achievement")
+								|| message.contains("combat achievements")
 				)
 		)
 		{
@@ -268,13 +275,13 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 	{
 		if (config.testPoisonFlash())
 		{
-			runColoredEffect("poison", config.poisonColor(), darken(config.poisonColor(), 0.25), config.poisonStyle());
+			runOverlayEffect("poison", config.poisonColor(), config.poisonStyle());
 			configManager.setConfiguration("osrgb", "testPoisonFlash", false);
 		}
 
 		if (config.testVenomFlash())
 		{
-			runColoredEffect("venom", config.venomColor(), darken(config.venomColor(), 0.25), config.venomStyle());
+			runOverlayEffect("venom", config.venomColor(), config.venomStyle());
 			configManager.setConfiguration("osrgb", "testVenomFlash", false);
 		}
 
@@ -332,11 +339,11 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 
 		if (config.enablePoisonFlash() && ailment.equals("POISON") && !criticalActive && !deathActive)
 		{
-			runColoredEffect("poison", config.poisonColor(), darken(config.poisonColor(), 0.25), config.poisonStyle());
+			runOverlayEffect("poison", config.poisonColor(), config.poisonStyle());
 		}
 		else if (config.enableVenomFlash() && ailment.equals("VENOM") && !criticalActive && !deathActive)
 		{
-			runColoredEffect("venom", config.venomColor(), darken(config.venomColor(), 0.25), config.venomStyle());
+			runOverlayEffect("venom", config.venomColor(), config.venomStyle());
 		}
 
 		lastAilment = ailment;
@@ -369,6 +376,7 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 		if (shouldCritical)
 		{
 			stopCurrentEffectAndWait();
+			stopOverlayEffectAndWait();
 			startCriticalEffect();
 
 			lastHp = hp;
@@ -385,6 +393,13 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 
 		if (effectActive)
 		{
+			return;
+		}
+
+		if (overlayActive)
+		{
+			lastHp = hp;
+			lastMaxHp = maxHp;
 			return;
 		}
 
@@ -471,6 +486,166 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 		thread.start();
 	}
 
+	private void runOverlayEffect(String effectName, Color overlayColor, EffectStyle style)
+	{
+		if (deathActive || criticalActive)
+		{
+			return;
+		}
+
+		stopOverlayEffectAndWait();
+
+		overlayActive = true;
+
+		Thread thread = new Thread(
+				() ->
+				{
+					try
+					{
+						runOverlayAnimation(style, overlayColor);
+					}
+					catch (InterruptedException ignored)
+					{
+					}
+					catch (Exception e)
+					{
+						log.error("OSRGB overlay error: {}", effectName, e);
+					}
+					finally
+					{
+						if (Thread.currentThread() == overlayThread)
+						{
+							overlayActive = false;
+							overlayThread = null;
+
+							lastHp = -1;
+							lastMaxHp = -1;
+							lastColor = null;
+
+							forceRestoreHpColor();
+						}
+					}
+				},
+				"OSRGB-Overlay-" + effectName
+		);
+
+		overlayThread = thread;
+		thread.setDaemon(true);
+		thread.start();
+	}
+
+	private void stopOverlayEffectAndWait()
+	{
+		if (!overlayActive)
+		{
+			return;
+		}
+
+		overlayActive = false;
+
+		Thread thread = overlayThread;
+
+		if (thread != null && thread != Thread.currentThread())
+		{
+			try
+			{
+				thread.interrupt();
+				thread.join(500);
+			}
+			catch (Exception ignored)
+			{
+			}
+		}
+
+		overlayThread = null;
+	}
+
+	private void runOverlayAnimation(EffectStyle style, Color overlayColor) throws InterruptedException
+	{
+		Color darkOverlay = darken(overlayColor, 0.25);
+
+		switch (style)
+		{
+			case STROBE:
+				for (int i = 0; i < 12 && overlayActive; i++)
+				{
+					sendOverlayFrame(overlayColor, 0.65);
+					sleepOverlay(80);
+					sendOverlayFrame(darkOverlay, 0.20);
+					sleepOverlay(80);
+				}
+				break;
+
+			case BREATHING:
+			case PULSE:
+				for (int loop = 0; loop < 4 && overlayActive; loop++)
+				{
+					for (int i = 0; i < 12 && overlayActive; i++)
+					{
+						sendOverlayFrame(overlayColor, i / 18.0);
+						sleepOverlay(35);
+					}
+
+					for (int i = 12; i >= 0 && overlayActive; i--)
+					{
+						sendOverlayFrame(overlayColor, i / 18.0);
+						sleepOverlay(35);
+					}
+				}
+				break;
+
+			case FIRE:
+			case LOOT_SHOWER:
+			case LIGHTNING:
+			default:
+				for (int i = 0; i < 8 && overlayActive; i++)
+				{
+					sendOverlayFrame(overlayColor, 0.65);
+					sleepOverlay(120);
+					sendOverlayFrame(darkOverlay, 0.25);
+					sleepOverlay(120);
+				}
+				break;
+		}
+	}
+
+	private void sendOverlayFrame(Color overlayColor, double strength)
+	{
+		if (deathActive || criticalActive)
+		{
+			overlayActive = false;
+			return;
+		}
+
+		int hp = client.getBoostedSkillLevel(Skill.HITPOINTS);
+		int maxHp = client.getRealSkillLevel(Skill.HITPOINTS);
+
+		if (maxHp <= 0 || hp <= 0)
+		{
+			overlayActive = false;
+			return;
+		}
+
+		Color hpColor = getHpColor(hp);
+		Color mixed = blend(hpColor, overlayColor, strength);
+
+		rgb.forceSetAllDevices(mixed);
+
+		lastHp = hp;
+		lastMaxHp = maxHp;
+		lastColor = mixed;
+	}
+
+	private void sleepOverlay(long millis) throws InterruptedException
+	{
+		long end = System.currentTimeMillis() + millis;
+
+		while (overlayActive && System.currentTimeMillis() < end)
+		{
+			Thread.sleep(Math.min(25, end - System.currentTimeMillis()));
+		}
+	}
+
 	private void runDeathEffect()
 	{
 		if (deathActive)
@@ -482,6 +657,7 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 
 		stopCriticalEffectAndWait();
 		stopCurrentEffectAndWait();
+		stopOverlayEffectAndWait();
 
 		Thread thread = new Thread(
 				() ->
@@ -575,6 +751,7 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 		}
 
 		stopCurrentEffectAndWait();
+		stopOverlayEffectAndWait();
 
 		effectActive = true;
 
@@ -645,6 +822,52 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 	{
 		switch (style)
 		{
+			case PANIC:
+				for (int i = 0; i < 20 && isAnimationActive(deathEffect); i++)
+				{
+					rgb.forceSetAllDevices(primary);
+					sleepAnimation(90, deathEffect);
+					rgb.forceSetAllDevices(secondary);
+					sleepAnimation(90, deathEffect);
+				}
+				break;
+
+			case LOOT_SHOWER:
+				for (int i = 0; i < 35 && isAnimationActive(deathEffect); i++)
+				{
+					Color color = random.nextBoolean()
+							? primary
+							: secondary;
+
+					if (random.nextDouble() < 0.25)
+					{
+						color = Color.WHITE;
+					}
+
+					rgb.forceSetAllDevices(color);
+					sleepAnimation(45 + random.nextInt(70), deathEffect);
+				}
+				break;
+
+			case GRIM_REAPER:
+				Color nearBlack = new Color(3, 0, 5);
+
+				for (int loop = 0; loop < 4 && isAnimationActive(deathEffect); loop++)
+				{
+					for (int i = 0; i < 18 && isAnimationActive(deathEffect); i++)
+					{
+						rgb.forceSetAllDevices(blend(nearBlack, primary, i / 17.0));
+						sleepAnimation(45, deathEffect);
+					}
+
+					for (int i = 17; i >= 0 && isAnimationActive(deathEffect); i--)
+					{
+						rgb.forceSetAllDevices(blend(nearBlack, secondary, i / 17.0));
+						sleepAnimation(45, deathEffect);
+					}
+				}
+				break;
+
 			case FLASH:
 				for (int i = 0; i < 5 && isAnimationActive(deathEffect); i++)
 				{
@@ -694,7 +917,7 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 					for (int i = 0; i < 20 && isAnimationActive(deathEffect); i++)
 					{
 						rgb.forceSetAllDevices(blend(primary, secondary, i / 19.0));
-						sleepAnimation(40, deathEffect);
+						sleepAnimation(40);
 					}
 				}
 				break;
@@ -779,6 +1002,11 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 		return deathEffect ? deathActive : effectActive;
 	}
 
+	private void sleepAnimation(long millis) throws InterruptedException
+	{
+		sleepAnimation(millis, false);
+	}
+
 	private void sleepAnimation(long millis, boolean deathEffect) throws InterruptedException
 	{
 		long end = System.currentTimeMillis() + millis;
@@ -857,6 +1085,30 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 	{
 		switch (style)
 		{
+			case PANIC:
+				int hp = Math.max(1, client.getBoostedSkillLevel(Skill.HITPOINTS));
+				int critical = Math.max(1, config.criticalHpValue());
+				double danger = 1.0 - Math.min(1.0, hp / (double) critical);
+				long speed = (long) (220 - (danger * 160));
+
+				rgb.forceSetAllDevices(primary);
+				sleepCritical(speed);
+				rgb.forceSetAllDevices(secondary);
+				sleepCritical(speed);
+				break;
+
+			case LOOT_SHOWER:
+				rgb.forceSetAllDevices(random.nextBoolean() ? primary : secondary);
+				sleepCritical(50 + random.nextInt(80));
+				break;
+
+			case GRIM_REAPER:
+				rgb.forceSetAllDevices(darken(primary, 0.30));
+				sleepCritical(250);
+				rgb.forceSetAllDevices(new Color(3, 0, 5));
+				sleepCritical(450);
+				break;
+
 			case FLASH:
 				if (!criticalActive || deathActive)
 				{
