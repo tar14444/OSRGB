@@ -10,6 +10,7 @@ import net.runelite.api.Client;
 import net.runelite.api.Skill;
 import net.runelite.api.VarPlayer;
 import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.ClientTick;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.StatChanged;
 
@@ -32,6 +33,14 @@ import java.util.Random;
 )
 public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 {
+	private enum AnimationKind
+	{
+		NONE,
+		EFFECT,
+		OVERLAY,
+		DEATH
+	}
+
 	@Inject
 	private Client client;
 
@@ -47,25 +56,24 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 	private final OpenRgbDirectClient rgb = new OpenRgbDirectClient();
 	private final Random random = new Random();
 
+	private final Map<Skill, Integer> lastSkillLevels =
+			new EnumMap<>(Skill.class);
+
 	private int lastHp = -1;
 	private int lastMaxHp = -1;
 	private Color lastColor = null;
 	private String lastAilment = "NONE";
 
-	private volatile boolean criticalActive = false;
-	private Thread criticalThread;
+	private AnimationKind animationKind = AnimationKind.NONE;
+	private String animationName = "";
+	private EffectStyle animationStyle = EffectStyle.FLASH;
+	private Color animationPrimary = Color.WHITE;
+	private Color animationSecondary = Color.BLACK;
+	private long animationStartTime = 0;
+	private long animationDuration = 0;
 
-	private volatile boolean effectActive = false;
-	private Thread effectThread;
-
-	private volatile boolean overlayActive = false;
-	private Thread overlayThread;
-
-	private volatile boolean deathActive = false;
-	private Thread deathThread;
-
-	private final Map<Skill, Integer> lastSkillLevels =
-			new EnumMap<>(Skill.class);
+	private long lastFrameTime = 0;
+	private boolean forceHpRefresh = true;
 
 	@Override
 	protected void startUp()
@@ -73,32 +81,26 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 		rgb.configure(config.openRgbHost(), config.openRgbPort());
 		rgb.connect();
 
-		lastHp = -1;
-		lastMaxHp = -1;
-		lastColor = null;
-		lastAilment = "NONE";
-
-		criticalActive = false;
-		effectActive = false;
-		overlayActive = false;
-		deathActive = false;
-
-		lastSkillLevels.clear();
+		clearState();
 	}
 
 	@Override
 	protected void shutDown()
 	{
-		stopCriticalEffectAndWait();
-		stopCurrentEffectAndWait();
-		stopOverlayEffectAndWait();
-		stopDeathEffectAndWait();
-
+		clearAnimation();
 		rgb.close();
+		clearState();
+	}
 
+	private void clearState()
+	{
 		lastHp = -1;
 		lastMaxHp = -1;
 		lastColor = null;
+		lastAilment = "NONE";
+		lastSkillLevels.clear();
+		forceHpRefresh = true;
+		clearAnimation();
 	}
 
 	@Subscribe
@@ -111,10 +113,7 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 
 		if ("openRgbHost".equals(event.getKey()) || "openRgbPort".equals(event.getKey()))
 		{
-			stopCriticalEffectAndWait();
-			stopCurrentEffectAndWait();
-			stopOverlayEffectAndWait();
-			stopDeathEffectAndWait();
+			clearAnimation();
 
 			rgb.configure(config.openRgbHost(), config.openRgbPort());
 			rgb.connect();
@@ -123,8 +122,7 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 		lastHp = -1;
 		lastMaxHp = -1;
 		lastColor = null;
-
-		forceRestoreHpColor();
+		forceHpRefresh = true;
 	}
 
 	@Subscribe
@@ -132,7 +130,21 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 	{
 		handleTestOptions();
 		handleAilments();
-		sendCurrentHpColor(false);
+	}
+
+	@Subscribe
+	public void onClientTick(ClientTick tick)
+	{
+		long now = System.currentTimeMillis();
+
+		if (now - lastFrameTime < 40)
+		{
+			return;
+		}
+
+		lastFrameTime = now;
+
+		updateRgb(now);
 	}
 
 	@Subscribe
@@ -140,7 +152,10 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 	{
 		if (event.getSkill() == Skill.HITPOINTS)
 		{
-			sendCurrentHpColor(true);
+			lastHp = -1;
+			lastMaxHp = -1;
+			lastColor = null;
+			forceHpRefresh = true;
 			return;
 		}
 
@@ -157,7 +172,7 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 
 		if (oldLevel != null && newLevel > oldLevel)
 		{
-			runSimpleEffect("level_up", config.levelUpStyle());
+			triggerLevelUpEvent();
 		}
 	}
 
@@ -180,13 +195,7 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 
 			if (totalValue >= threshold)
 			{
-				runColoredEffect(
-						"valuable_drop",
-						config.valuableDropColor(),
-						darken(config.valuableDropColor(), 0.25),
-						config.valuableDropStyle()
-				);
-
+				triggerValuableDropEvent();
 				return;
 			}
 		}
@@ -212,7 +221,7 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 				)
 		)
 		{
-			runDeathEffect();
+			triggerDeathEvent();
 			return;
 		}
 
@@ -226,28 +235,19 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 				)
 		)
 		{
-			runColoredEffect(
-					"combat_achievement",
-					config.combatAchievementPrimaryColor(),
-					config.combatAchievementSecondaryColor(),
-					config.combatAchievementStyle()
-			);
+			triggerCombatAchievementEvent();
 		}
 
 		if (
 				config.enableCollectionLogFlash()
 						&& (
-						message.contains("new item added to your collection log")
+						message.contains("collection log")
+								|| message.contains("new item added")
 								|| message.contains("added to your collection log")
 				)
 		)
 		{
-			runColoredEffect(
-					"collection_log",
-					config.collectionLogPrimaryColor(),
-					config.collectionLogSecondaryColor(),
-					config.collectionLogStyle()
-			);
+			triggerCollectionLogEvent();
 		}
 
 		if (
@@ -260,14 +260,10 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 								|| message.contains("you have completed the")
 				)
 						&& !message.contains("combat achievement")
+						&& !message.contains("combat task")
 		)
 		{
-			runColoredEffect(
-					"quest_complete",
-					config.questPrimaryColor(),
-					config.questSecondaryColor(),
-					config.questStyle()
-			);
+			triggerQuestEvent();
 		}
 	}
 
@@ -275,55 +271,62 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 	{
 		if (config.testPoisonFlash())
 		{
-			runOverlayEffect("poison", config.poisonColor(), config.poisonStyle());
+			triggerPoisonEvent();
 			configManager.setConfiguration("osrgb", "testPoisonFlash", false);
 		}
 
 		if (config.testVenomFlash())
 		{
-			runOverlayEffect("venom", config.venomColor(), config.venomStyle());
+			triggerVenomEvent();
 			configManager.setConfiguration("osrgb", "testVenomFlash", false);
 		}
 
 		if (config.testCriticalPulse())
 		{
-			runColoredEffect("critical_test", config.criticalHpColor(), darken(config.criticalHpColor(), 0.15), config.criticalStyle());
+			startAnimation(
+					"critical_test",
+					AnimationKind.EFFECT,
+					config.criticalStyle(),
+					config.criticalHpColor(),
+					darken(config.criticalHpColor(), 0.15),
+					getEffectDuration(config.criticalStyle())
+			);
 			configManager.setConfiguration("osrgb", "testCriticalPulse", false);
 		}
 
 		if (config.testLevelUpFlash())
 		{
-			runSimpleEffect("level_up", config.levelUpStyle());
+			triggerLevelUpEvent();
 			configManager.setConfiguration("osrgb", "testLevelUpFlash", false);
 		}
 
 		if (config.testCombatAchievementFlash())
 		{
-			runColoredEffect("combat_achievement", config.combatAchievementPrimaryColor(), config.combatAchievementSecondaryColor(), config.combatAchievementStyle());
+			triggerCombatAchievementEvent();
 			configManager.setConfiguration("osrgb", "testCombatAchievementFlash", false);
 		}
 
 		if (config.testValuableDropFlash())
 		{
-			runColoredEffect("valuable_drop", config.valuableDropColor(), darken(config.valuableDropColor(), 0.25), config.valuableDropStyle());
+			triggerValuableDropEvent();
 			configManager.setConfiguration("osrgb", "testValuableDropFlash", false);
 		}
 
 		if (config.testDeathFlash())
 		{
-			runDeathEffect();
+			triggerDeathEvent();
 			configManager.setConfiguration("osrgb", "testDeathFlash", false);
 		}
 
 		if (config.testCollectionLogFlash())
 		{
-			runColoredEffect("collection_log", config.collectionLogPrimaryColor(), config.collectionLogSecondaryColor(), config.collectionLogStyle());
+			triggerCollectionLogEvent();
 			configManager.setConfiguration("osrgb", "testCollectionLogFlash", false);
 		}
 
 		if (config.testQuestFlash())
 		{
-			runColoredEffect("quest_complete", config.questPrimaryColor(), config.questSecondaryColor(), config.questStyle());
+			triggerQuestEvent();
 			configManager.setConfiguration("osrgb", "testQuestFlash", false);
 		}
 	}
@@ -337,25 +340,165 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 			return;
 		}
 
-		if (config.enablePoisonFlash() && ailment.equals("POISON") && !criticalActive && !deathActive)
+		if (config.enablePoisonFlash() && ailment.equals("POISON") && !isCriticalHp())
 		{
-			runOverlayEffect("poison", config.poisonColor(), config.poisonStyle());
+			triggerPoisonEvent();
 		}
-		else if (config.enableVenomFlash() && ailment.equals("VENOM") && !criticalActive && !deathActive)
+		else if (config.enableVenomFlash() && ailment.equals("VENOM") && !isCriticalHp())
 		{
-			runOverlayEffect("venom", config.venomColor(), config.venomStyle());
+			triggerVenomEvent();
 		}
 
 		lastAilment = ailment;
 	}
 
-	private void sendCurrentHpColor(boolean force)
+	private void triggerPoisonEvent()
 	{
-		if (deathActive)
+		startAnimation(
+				"poison",
+				AnimationKind.OVERLAY,
+				config.poisonStyle(),
+				config.poisonColor(),
+				darken(config.poisonColor(), 0.25),
+				getOverlayDuration(config.poisonStyle())
+		);
+	}
+
+	private void triggerVenomEvent()
+	{
+		startAnimation(
+				"venom",
+				AnimationKind.OVERLAY,
+				config.venomStyle(),
+				config.venomColor(),
+				darken(config.venomColor(), 0.25),
+				getOverlayDuration(config.venomStyle())
+		);
+	}
+
+	private void triggerLevelUpEvent()
+	{
+		Color hpColor = getHpColor(getSafeHp());
+
+		startAnimation(
+				"level_up",
+				AnimationKind.EFFECT,
+				config.levelUpStyle(),
+				hpColor,
+				darken(hpColor, 0.25),
+				getEffectDuration(config.levelUpStyle())
+		);
+	}
+
+	private void triggerCombatAchievementEvent()
+	{
+		startAnimation(
+				"combat_achievement",
+				AnimationKind.EFFECT,
+				config.combatAchievementStyle(),
+				config.combatAchievementPrimaryColor(),
+				config.combatAchievementSecondaryColor(),
+				getEffectDuration(config.combatAchievementStyle())
+		);
+	}
+
+	private void triggerValuableDropEvent()
+	{
+		startAnimation(
+				"valuable_drop",
+				AnimationKind.EFFECT,
+				config.valuableDropStyle(),
+				config.valuableDropColor(),
+				darken(config.valuableDropColor(), 0.25),
+				getEffectDuration(config.valuableDropStyle())
+		);
+	}
+
+	private void triggerDeathEvent()
+	{
+		startAnimation(
+				"death",
+				AnimationKind.DEATH,
+				config.deathStyle(),
+				config.deathPrimaryColor(),
+				config.deathSecondaryColor(),
+				getEffectDuration(config.deathStyle())
+		);
+	}
+
+	private void triggerCollectionLogEvent()
+	{
+		startAnimation(
+				"collection_log",
+				AnimationKind.EFFECT,
+				config.collectionLogStyle(),
+				config.collectionLogPrimaryColor(),
+				config.collectionLogSecondaryColor(),
+				getEffectDuration(config.collectionLogStyle())
+		);
+	}
+
+	private void triggerQuestEvent()
+	{
+		startAnimation(
+				"quest_complete",
+				AnimationKind.EFFECT,
+				config.questStyle(),
+				config.questPrimaryColor(),
+				config.questSecondaryColor(),
+				getEffectDuration(config.questStyle())
+		);
+	}
+
+	private void startAnimation(
+			String name,
+			AnimationKind kind,
+			EffectStyle style,
+			Color primary,
+			Color secondary,
+			long duration
+	)
+	{
+		if (kind != AnimationKind.DEATH && animationKind == AnimationKind.DEATH)
 		{
 			return;
 		}
 
+		if (kind == AnimationKind.EFFECT && isCriticalHp() && !"critical_test".equals(name))
+		{
+			return;
+		}
+
+		if (kind == AnimationKind.OVERLAY && isCriticalHp())
+		{
+			return;
+		}
+
+		animationName = name;
+		animationKind = kind;
+		animationStyle = style;
+		animationPrimary = primary;
+		animationSecondary = secondary;
+		animationStartTime = System.currentTimeMillis();
+		animationDuration = Math.max(250, duration);
+
+		lastHp = -1;
+		lastMaxHp = -1;
+		lastColor = null;
+		forceHpRefresh = true;
+	}
+
+	private void clearAnimation()
+	{
+		animationKind = AnimationKind.NONE;
+		animationName = "";
+		animationStartTime = 0;
+		animationDuration = 0;
+		forceHpRefresh = true;
+	}
+
+	private void updateRgb(long now)
+	{
 		int hp = client.getBoostedSkillLevel(Skill.HITPOINTS);
 		int maxHp = client.getRealSkillLevel(Skill.HITPOINTS);
 
@@ -364,42 +507,106 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 			return;
 		}
 
+		if (animationKind != AnimationKind.NONE)
+		{
+			long elapsed = now - animationStartTime;
+
+			if (elapsed >= animationDuration)
+			{
+				clearAnimation();
+				forceHpRefresh = true;
+			}
+			else
+			{
+				sendAnimationFrame(elapsed, hp, maxHp);
+				return;
+			}
+		}
+
+		if (hp > 0 && isCriticalHp())
+		{
+			sendCriticalFrame(now, hp);
+			return;
+		}
+
 		if (hp <= 0)
 		{
-			stopCriticalEffectAndWait();
 			return;
 		}
 
-		boolean shouldCritical =
-				config.enableCriticalPulse() && hp <= config.criticalHpValue();
+		sendHpColor(hp, maxHp, forceHpRefresh);
+		forceHpRefresh = false;
+	}
 
-		if (shouldCritical)
+	private void sendAnimationFrame(long elapsed, int hp, int maxHp)
+	{
+		if (animationKind == AnimationKind.DEATH)
 		{
-			stopCurrentEffectAndWait();
-			stopOverlayEffectAndWait();
-			startCriticalEffect();
+			Color frame = getStyleFrame(animationStyle, animationPrimary, animationSecondary, elapsed, animationDuration);
+			rgb.forceSetAllDevices(frame);
+			lastColor = frame;
+			return;
+		}
+
+		if (hp <= 0)
+		{
+			clearAnimation();
+			return;
+		}
+
+		if (animationKind == AnimationKind.OVERLAY)
+		{
+			if (isCriticalHp())
+			{
+				clearAnimation();
+				return;
+			}
+
+			Color hpColor = getHpColor(hp);
+			double strength = getOverlayStrength(animationStyle, elapsed, animationDuration);
+			Color overlayFrame = getStyleFrame(animationStyle, animationPrimary, animationSecondary, elapsed, animationDuration);
+			Color mixed = blend(hpColor, overlayFrame, strength);
+
+			rgb.forceSetAllDevices(mixed);
 
 			lastHp = hp;
 			lastMaxHp = maxHp;
+			lastColor = mixed;
 			return;
 		}
 
-		if (criticalActive)
+		if (animationKind == AnimationKind.EFFECT)
 		{
-			stopCriticalEffectAndWait();
-			delayedForceRestoreHpColor();
-			return;
-		}
+			if (isCriticalHp() && !"critical_test".equals(animationName))
+			{
+				clearAnimation();
+				return;
+			}
 
-		if (effectActive)
-		{
-			return;
+			Color frame = getStyleFrame(animationStyle, animationPrimary, animationSecondary, elapsed, animationDuration);
+			rgb.forceSetAllDevices(frame);
+			lastColor = frame;
 		}
+	}
 
-		if (overlayActive)
+	private void sendCriticalFrame(long now, int hp)
+	{
+		Color primary = config.criticalHpColor();
+		Color secondary = darken(primary, 0.15);
+
+		Color frame = getCriticalFrame(config.criticalStyle(), primary, secondary, now, hp);
+
+		rgb.forceSetAllDevices(frame);
+
+		lastHp = hp;
+		lastMaxHp = client.getRealSkillLevel(Skill.HITPOINTS);
+		lastColor = frame;
+	}
+
+	private void sendHpColor(int hp, int maxHp, boolean force)
+	{
+		if (!config.enableHpColors())
 		{
-			lastHp = hp;
-			lastMaxHp = maxHp;
 			return;
 		}
 
@@ -430,526 +637,105 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 		lastColor = hpColor;
 	}
 
-	private void forceRestoreHpColor()
+	private Color getCriticalFrame(EffectStyle style, Color primary, Color secondary, long now, int hp)
 	{
-		if (deathActive)
+		if (style == EffectStyle.PANIC)
 		{
-			return;
+			int critical = Math.max(1, config.criticalHpValue());
+			double danger = 1.0 - Math.min(1.0, hp / (double) critical);
+			long speed = (long) (220 - (danger * 160));
+			long phase = (now / Math.max(40, speed)) % 2;
+
+			return phase == 0 ? primary : secondary;
 		}
 
-		int hp = client.getBoostedSkillLevel(Skill.HITPOINTS);
-		int maxHp = client.getRealSkillLevel(Skill.HITPOINTS);
-
-		if (maxHp <= 0 || hp <= 0)
+		if (style == EffectStyle.GRIM_REAPER)
 		{
-			return;
+			long cycle = now % 1400;
+			double t = cycle < 700
+					? cycle / 700.0
+					: 1.0 - ((cycle - 700) / 700.0);
+
+			return blend(new Color(3, 0, 5), primary, t);
 		}
 
-		if (config.enableCriticalPulse() && hp <= config.criticalHpValue())
+		if (style == EffectStyle.LOOT_SHOWER)
 		{
-			startCriticalEffect();
-			return;
+			return ((now / 90) % 3) == 0
+					? Color.WHITE
+					: (((now / 90) % 2) == 0 ? primary : secondary);
 		}
 
-		Color hpColor = getHpColor(hp);
-
-		rgb.forceSetAllDevices(hpColor);
-
-		lastHp = hp;
-		lastMaxHp = maxHp;
-		lastColor = hpColor;
+		return getLoopingStyleFrame(style, primary, secondary, now);
 	}
 
-	private void delayedForceRestoreHpColor()
-	{
-		Thread thread = new Thread(
-				() ->
-				{
-					try
-					{
-						Thread.sleep(150);
-					}
-					catch (InterruptedException ignored)
-					{
-					}
-
-					lastHp = -1;
-					lastMaxHp = -1;
-					lastColor = null;
-
-					forceRestoreHpColor();
-				},
-				"OSRGB-Restore-HP"
-		);
-
-		thread.setDaemon(true);
-		thread.start();
-	}
-
-	private void runOverlayEffect(String effectName, Color overlayColor, EffectStyle style)
-	{
-		if (deathActive || criticalActive)
-		{
-			return;
-		}
-
-		stopOverlayEffectAndWait();
-
-		overlayActive = true;
-
-		Thread thread = new Thread(
-				() ->
-				{
-					try
-					{
-						runOverlayAnimation(style, overlayColor);
-					}
-					catch (InterruptedException ignored)
-					{
-					}
-					catch (Exception e)
-					{
-						log.error("OSRGB overlay error: {}", effectName, e);
-					}
-					finally
-					{
-						if (Thread.currentThread() == overlayThread)
-						{
-							overlayActive = false;
-							overlayThread = null;
-
-							lastHp = -1;
-							lastMaxHp = -1;
-							lastColor = null;
-
-							forceRestoreHpColor();
-						}
-					}
-				},
-				"OSRGB-Overlay-" + effectName
-		);
-
-		overlayThread = thread;
-		thread.setDaemon(true);
-		thread.start();
-	}
-
-	private void stopOverlayEffectAndWait()
-	{
-		if (!overlayActive)
-		{
-			return;
-		}
-
-		overlayActive = false;
-
-		Thread thread = overlayThread;
-
-		if (thread != null && thread != Thread.currentThread())
-		{
-			try
-			{
-				thread.interrupt();
-				thread.join(500);
-			}
-			catch (Exception ignored)
-			{
-			}
-		}
-
-		overlayThread = null;
-	}
-
-	private void runOverlayAnimation(EffectStyle style, Color overlayColor) throws InterruptedException
-	{
-		Color darkOverlay = darken(overlayColor, 0.25);
-
-		switch (style)
-		{
-			case STROBE:
-				for (int i = 0; i < 12 && overlayActive; i++)
-				{
-					sendOverlayFrame(overlayColor, 0.65);
-					sleepOverlay(80);
-					sendOverlayFrame(darkOverlay, 0.20);
-					sleepOverlay(80);
-				}
-				break;
-
-			case BREATHING:
-			case PULSE:
-				for (int loop = 0; loop < 4 && overlayActive; loop++)
-				{
-					for (int i = 0; i < 12 && overlayActive; i++)
-					{
-						sendOverlayFrame(overlayColor, i / 18.0);
-						sleepOverlay(35);
-					}
-
-					for (int i = 12; i >= 0 && overlayActive; i--)
-					{
-						sendOverlayFrame(overlayColor, i / 18.0);
-						sleepOverlay(35);
-					}
-				}
-				break;
-
-			case FIRE:
-			case LOOT_SHOWER:
-			case LIGHTNING:
-			default:
-				for (int i = 0; i < 8 && overlayActive; i++)
-				{
-					sendOverlayFrame(overlayColor, 0.65);
-					sleepOverlay(120);
-					sendOverlayFrame(darkOverlay, 0.25);
-					sleepOverlay(120);
-				}
-				break;
-		}
-	}
-
-	private void sendOverlayFrame(Color overlayColor, double strength)
-	{
-		if (deathActive || criticalActive)
-		{
-			overlayActive = false;
-			return;
-		}
-
-		int hp = client.getBoostedSkillLevel(Skill.HITPOINTS);
-		int maxHp = client.getRealSkillLevel(Skill.HITPOINTS);
-
-		if (maxHp <= 0 || hp <= 0)
-		{
-			overlayActive = false;
-			return;
-		}
-
-		Color hpColor = getHpColor(hp);
-		Color mixed = blend(hpColor, overlayColor, strength);
-
-		rgb.forceSetAllDevices(mixed);
-
-		lastHp = hp;
-		lastMaxHp = maxHp;
-		lastColor = mixed;
-	}
-
-	private void sleepOverlay(long millis) throws InterruptedException
-	{
-		long end = System.currentTimeMillis() + millis;
-
-		while (overlayActive && System.currentTimeMillis() < end)
-		{
-			Thread.sleep(Math.min(25, end - System.currentTimeMillis()));
-		}
-	}
-
-	private void runDeathEffect()
-	{
-		if (deathActive)
-		{
-			return;
-		}
-
-		deathActive = true;
-
-		stopCriticalEffectAndWait();
-		stopCurrentEffectAndWait();
-		stopOverlayEffectAndWait();
-
-		Thread thread = new Thread(
-				() ->
-				{
-					try
-					{
-						runEffectAnimation(
-								config.deathStyle(),
-								config.deathPrimaryColor(),
-								config.deathSecondaryColor(),
-								true
-						);
-					}
-					catch (InterruptedException ignored)
-					{
-					}
-					catch (Exception e)
-					{
-						log.error("OSRGB death effect error", e);
-					}
-					finally
-					{
-						if (Thread.currentThread() == deathThread)
-						{
-							deathActive = false;
-							deathThread = null;
-
-							lastHp = -1;
-							lastMaxHp = -1;
-							lastColor = null;
-
-							delayedForceRestoreHpColor();
-						}
-					}
-				},
-				"OSRGB-Death-Effect"
-		);
-
-		deathThread = thread;
-		thread.setDaemon(true);
-		thread.start();
-	}
-
-	private void stopDeathEffectAndWait()
-	{
-		if (!deathActive)
-		{
-			return;
-		}
-
-		deathActive = false;
-
-		Thread thread = deathThread;
-
-		if (thread != null && thread != Thread.currentThread())
-		{
-			try
-			{
-				thread.interrupt();
-				thread.join(500);
-			}
-			catch (Exception ignored)
-			{
-			}
-		}
-
-		deathThread = null;
-	}
-
-	private void runSimpleEffect(String effectName, EffectStyle style)
-	{
-		Color hpColor = getHpColor(client.getBoostedSkillLevel(Skill.HITPOINTS));
-		runEffect(effectName, hpColor, darken(hpColor, 0.25), style);
-	}
-
-	private void runColoredEffect(String effectName, Color primary, Color secondary, EffectStyle style)
-	{
-		runEffect(effectName, primary, secondary, style);
-	}
-
-	private synchronized void runEffect(String effectName, Color primary, Color secondary, EffectStyle style)
-	{
-		if (deathActive)
-		{
-			return;
-		}
-
-		if (criticalActive && !effectName.equals("critical_test"))
-		{
-			return;
-		}
-
-		stopCurrentEffectAndWait();
-		stopOverlayEffectAndWait();
-
-		effectActive = true;
-
-		Thread thread = new Thread(
-				() ->
-				{
-					try
-					{
-						runEffectAnimation(style, primary, secondary, false);
-					}
-					catch (InterruptedException ignored)
-					{
-					}
-					catch (Exception e)
-					{
-						log.error("OSRGB effect error: {}", effectName, e);
-					}
-					finally
-					{
-						if (Thread.currentThread() == effectThread)
-						{
-							effectActive = false;
-							effectThread = null;
-
-							lastHp = -1;
-							lastMaxHp = -1;
-							lastColor = null;
-
-							delayedForceRestoreHpColor();
-						}
-					}
-				},
-				"OSRGB-Effect-" + effectName
-		);
-
-		effectThread = thread;
-		thread.setDaemon(true);
-		thread.start();
-	}
-
-	private void stopCurrentEffectAndWait()
-	{
-		if (!effectActive)
-		{
-			return;
-		}
-
-		effectActive = false;
-
-		Thread thread = effectThread;
-
-		if (thread != null && thread != Thread.currentThread())
-		{
-			try
-			{
-				thread.interrupt();
-				thread.join(500);
-			}
-			catch (Exception ignored)
-			{
-			}
-		}
-
-		effectThread = null;
-	}
-
-	private void runEffectAnimation(EffectStyle style, Color primary, Color secondary, boolean deathEffect) throws InterruptedException
+	private Color getStyleFrame(
+			EffectStyle style,
+			Color primary,
+			Color secondary,
+			long elapsed,
+			long duration
+	)
 	{
 		switch (style)
 		{
 			case PANIC:
-				for (int i = 0; i < 20 && isAnimationActive(deathEffect); i++)
-				{
-					rgb.forceSetAllDevices(primary);
-					sleepAnimation(90, deathEffect);
-					rgb.forceSetAllDevices(secondary);
-					sleepAnimation(90, deathEffect);
-				}
-				break;
+			{
+				long phase = (elapsed / 90) % 2;
+				return phase == 0 ? primary : secondary;
+			}
 
 			case LOOT_SHOWER:
-				for (int i = 0; i < 35 && isAnimationActive(deathEffect); i++)
+			{
+				long phase = elapsed / 70;
+
+				if (phase % 5 == 0)
 				{
-					Color color = random.nextBoolean()
-							? primary
-							: secondary;
-
-					if (random.nextDouble() < 0.25)
-					{
-						color = Color.WHITE;
-					}
-
-					rgb.forceSetAllDevices(color);
-					sleepAnimation(45 + random.nextInt(70), deathEffect);
+					return Color.WHITE;
 				}
-				break;
+
+				return phase % 2 == 0 ? primary : secondary;
+			}
 
 			case GRIM_REAPER:
-				Color nearBlack = new Color(3, 0, 5);
+			{
+				double cycle = (elapsed % 1600) / 1600.0;
 
-				for (int loop = 0; loop < 4 && isAnimationActive(deathEffect); loop++)
+				if (cycle < 0.5)
 				{
-					for (int i = 0; i < 18 && isAnimationActive(deathEffect); i++)
-					{
-						rgb.forceSetAllDevices(blend(nearBlack, primary, i / 17.0));
-						sleepAnimation(45, deathEffect);
-					}
-
-					for (int i = 17; i >= 0 && isAnimationActive(deathEffect); i--)
-					{
-						rgb.forceSetAllDevices(blend(nearBlack, secondary, i / 17.0));
-						sleepAnimation(45, deathEffect);
-					}
+					return blend(new Color(3, 0, 5), primary, cycle * 2.0);
 				}
-				break;
+
+				return blend(primary, secondary, (cycle - 0.5) * 2.0);
+			}
 
 			case FLASH:
-				for (int i = 0; i < 5 && isAnimationActive(deathEffect); i++)
-				{
-					rgb.forceSetAllDevices(primary);
-					sleepAnimation(300, deathEffect);
-					rgb.forceSetAllDevices(secondary);
-					sleepAnimation(700, deathEffect);
-				}
-				break;
+			{
+				long cycle = elapsed % 1000;
+				return cycle < 300 ? primary : secondary;
+			}
 
 			case PULSE:
-				for (int loop = 0; loop < 5 && isAnimationActive(deathEffect); loop++)
-				{
-					for (int i = 0; i < 10 && isAnimationActive(deathEffect); i++)
-					{
-						rgb.forceSetAllDevices(blend(secondary, primary, i / 9.0));
-						sleepAnimation(35, deathEffect);
-					}
-
-					for (int i = 0; i < 10 && isAnimationActive(deathEffect); i++)
-					{
-						rgb.forceSetAllDevices(blend(primary, secondary, i / 9.0));
-						sleepAnimation(35, deathEffect);
-					}
-				}
-				break;
+			case BREATHING:
+			{
+				double t = triangleWave(elapsed, style == EffectStyle.BREATHING ? 1600 : 700);
+				return blend(secondary, primary, t);
+			}
 
 			case STROBE:
-				for (int i = 0; i < 12 && isAnimationActive(deathEffect); i++)
-				{
-					rgb.forceSetAllDevices(primary);
-					sleepAnimation(80, deathEffect);
-					rgb.forceSetAllDevices(secondary);
-					sleepAnimation(80, deathEffect);
-				}
-				break;
-
-			case BREATHING:
-				for (int loop = 0; loop < 3 && isAnimationActive(deathEffect); loop++)
-				{
-					for (int i = 0; i < 20 && isAnimationActive(deathEffect); i++)
-					{
-						rgb.forceSetAllDevices(blend(secondary, primary, i / 19.0));
-						sleepAnimation(40, deathEffect);
-					}
-
-					for (int i = 0; i < 20 && isAnimationActive(deathEffect); i++)
-					{
-						rgb.forceSetAllDevices(blend(primary, secondary, i / 19.0));
-						sleepAnimation(40);
-					}
-				}
-				break;
+			{
+				return ((elapsed / 80) % 2) == 0 ? primary : secondary;
+			}
 
 			case RAINBOW:
-				Color[] rainbow = new Color[]
-						{
-								new Color(255, 0, 0),
-								new Color(255, 128, 0),
-								new Color(255, 255, 0),
-								new Color(0, 255, 0),
-								new Color(0, 255, 255),
-								new Color(0, 80, 255),
-								new Color(170, 0, 255)
-						};
-
-				for (int loop = 0; loop < 3 && isAnimationActive(deathEffect); loop++)
-				{
-					for (Color color : rainbow)
-					{
-						if (!isAnimationActive(deathEffect))
-						{
-							break;
-						}
-
-						rgb.forceSetAllDevices(color);
-						sleepAnimation(120, deathEffect);
-					}
-				}
-				break;
+			{
+				Color[] rainbow = getRainbow();
+				int index = (int) ((elapsed / 120) % rainbow.length);
+				return rainbow[index];
+			}
 
 			case FIRE:
+			{
 				Color[] fire = new Color[]
 						{
 								primary,
@@ -960,314 +746,111 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 								darken(primary, 0.35)
 						};
 
-				for (int i = 0; i < 40 && isAnimationActive(deathEffect); i++)
-				{
-					rgb.forceSetAllDevices(fire[random.nextInt(fire.length)]);
-					sleepAnimation(40 + random.nextInt(90), deathEffect);
-				}
-				break;
+				int index = (int) ((elapsed / 80) % fire.length);
+				return fire[index];
+			}
 
 			case LIGHTNING:
-				for (int i = 0; i < 25 && isAnimationActive(deathEffect); i++)
-				{
-					rgb.forceSetAllDevices(secondary);
-					sleepAnimation(50 + random.nextInt(140), deathEffect);
+			{
+				long cycle = elapsed % 600;
 
-					if (random.nextDouble() < 0.45 && isAnimationActive(deathEffect))
-					{
-						rgb.forceSetAllDevices(Color.WHITE);
-						sleepAnimation(40, deathEffect);
-						rgb.forceSetAllDevices(primary);
-						sleepAnimation(50, deathEffect);
-						rgb.forceSetAllDevices(Color.WHITE);
-						sleepAnimation(30, deathEffect);
-					}
+				if (cycle < 50 || (cycle > 120 && cycle < 160))
+				{
+					return Color.WHITE;
 				}
-				break;
+
+				return cycle < 250 ? primary : secondary;
+			}
 
 			default:
-				for (int i = 0; i < 5 && isAnimationActive(deathEffect); i++)
-				{
-					rgb.forceSetAllDevices(primary);
-					sleepAnimation(300, deathEffect);
-					rgb.forceSetAllDevices(secondary);
-					sleepAnimation(700, deathEffect);
-				}
-				break;
+				return primary;
 		}
 	}
 
-	private boolean isAnimationActive(boolean deathEffect)
+	private Color getLoopingStyleFrame(EffectStyle style, Color primary, Color secondary, long now)
 	{
-		return deathEffect ? deathActive : effectActive;
+		return getStyleFrame(style, primary, secondary, now % 5000, 5000);
 	}
 
-	private void sleepAnimation(long millis) throws InterruptedException
-	{
-		sleepAnimation(millis, false);
-	}
-
-	private void sleepAnimation(long millis, boolean deathEffect) throws InterruptedException
-	{
-		long end = System.currentTimeMillis() + millis;
-
-		while (isAnimationActive(deathEffect) && System.currentTimeMillis() < end)
-		{
-			Thread.sleep(Math.min(25, end - System.currentTimeMillis()));
-		}
-	}
-
-	private void startCriticalEffect()
-	{
-		if (criticalActive || deathActive)
-		{
-			return;
-		}
-
-		criticalActive = true;
-
-		criticalThread = new Thread(this::criticalLoop, "OSRGB-Critical-Effect");
-		criticalThread.setDaemon(true);
-		criticalThread.start();
-	}
-
-	private void stopCriticalEffectAndWait()
-	{
-		if (!criticalActive)
-		{
-			return;
-		}
-
-		criticalActive = false;
-
-		Thread thread = criticalThread;
-
-		if (thread != null && thread != Thread.currentThread())
-		{
-			try
-			{
-				thread.interrupt();
-				thread.join(500);
-			}
-			catch (Exception ignored)
-			{
-			}
-		}
-
-		criticalThread = null;
-	}
-
-	private void criticalLoop()
-	{
-		while (criticalActive && !deathActive)
-		{
-			try
-			{
-				runCriticalAnimationStep(
-						config.criticalStyle(),
-						config.criticalHpColor(),
-						darken(config.criticalHpColor(), 0.15)
-				);
-			}
-			catch (InterruptedException e)
-			{
-				return;
-			}
-			catch (Exception e)
-			{
-				log.error("Critical effect error", e);
-				return;
-			}
-		}
-	}
-
-	private void runCriticalAnimationStep(EffectStyle style, Color primary, Color secondary) throws InterruptedException
+	private double getOverlayStrength(EffectStyle style, long elapsed, long duration)
 	{
 		switch (style)
 		{
-			case PANIC:
-				int hp = Math.max(1, client.getBoostedSkillLevel(Skill.HITPOINTS));
-				int critical = Math.max(1, config.criticalHpValue());
-				double danger = 1.0 - Math.min(1.0, hp / (double) critical);
-				long speed = (long) (220 - (danger * 160));
-
-				rgb.forceSetAllDevices(primary);
-				sleepCritical(speed);
-				rgb.forceSetAllDevices(secondary);
-				sleepCritical(speed);
-				break;
-
-			case LOOT_SHOWER:
-				rgb.forceSetAllDevices(random.nextBoolean() ? primary : secondary);
-				sleepCritical(50 + random.nextInt(80));
-				break;
-
-			case GRIM_REAPER:
-				rgb.forceSetAllDevices(darken(primary, 0.30));
-				sleepCritical(250);
-				rgb.forceSetAllDevices(new Color(3, 0, 5));
-				sleepCritical(450);
-				break;
-
-			case FLASH:
-				if (!criticalActive || deathActive)
-				{
-					return;
-				}
-				rgb.forceSetAllDevices(primary);
-				sleepCritical(300);
-				if (!criticalActive || deathActive)
-				{
-					return;
-				}
-				rgb.forceSetAllDevices(secondary);
-				sleepCritical(700);
-				break;
-
-			case PULSE:
-				for (int i = 0; i < 10 && criticalActive && !deathActive; i++)
-				{
-					rgb.forceSetAllDevices(blend(secondary, primary, i / 9.0));
-					sleepCritical(35);
-				}
-
-				for (int i = 0; i < 10 && criticalActive && !deathActive; i++)
-				{
-					rgb.forceSetAllDevices(blend(primary, secondary, i / 9.0));
-					sleepCritical(35);
-				}
-				break;
-
 			case STROBE:
-				if (!criticalActive || deathActive)
-				{
-					return;
-				}
-				rgb.forceSetAllDevices(primary);
-				sleepCritical(80);
-				if (!criticalActive || deathActive)
-				{
-					return;
-				}
-				rgb.forceSetAllDevices(secondary);
-				sleepCritical(80);
-				break;
+				return ((elapsed / 100) % 2) == 0 ? 0.65 : 0.20;
 
 			case BREATHING:
-				for (int i = 0; i < 20 && criticalActive && !deathActive; i++)
-				{
-					rgb.forceSetAllDevices(blend(secondary, primary, i / 19.0));
-					sleepCritical(40);
-				}
-
-				for (int i = 0; i < 20 && criticalActive && !deathActive; i++)
-				{
-					rgb.forceSetAllDevices(blend(primary, secondary, i / 19.0));
-					sleepCritical(40);
-				}
-				break;
-
-			case RAINBOW:
-				Color[] rainbow = new Color[]
-						{
-								new Color(255, 0, 0),
-								new Color(255, 128, 0),
-								new Color(255, 255, 0),
-								new Color(0, 255, 0),
-								new Color(0, 255, 255),
-								new Color(0, 80, 255),
-								new Color(170, 0, 255)
-						};
-
-				for (Color color : rainbow)
-				{
-					if (!criticalActive || deathActive)
-					{
-						break;
-					}
-
-					rgb.forceSetAllDevices(color);
-					sleepCritical(120);
-				}
-				break;
-
-			case FIRE:
-				Color[] fire = new Color[]
-						{
-								primary,
-								secondary,
-								new Color(255, 80, 0),
-								new Color(255, 150, 0),
-								new Color(255, 220, 40),
-								darken(primary, 0.35)
-						};
-
-				if (!criticalActive || deathActive)
-				{
-					return;
-				}
-
-				rgb.forceSetAllDevices(fire[random.nextInt(fire.length)]);
-				sleepCritical(40 + random.nextInt(90));
-				break;
-
-			case LIGHTNING:
-				if (!criticalActive || deathActive)
-				{
-					return;
-				}
-
-				rgb.forceSetAllDevices(secondary);
-				sleepCritical(50 + random.nextInt(140));
-
-				if (random.nextDouble() < 0.45 && criticalActive && !deathActive)
-				{
-					rgb.forceSetAllDevices(Color.WHITE);
-					sleepCritical(40);
-
-					if (!criticalActive || deathActive)
-					{
-						return;
-					}
-
-					rgb.forceSetAllDevices(primary);
-					sleepCritical(50);
-
-					if (!criticalActive || deathActive)
-					{
-						return;
-					}
-
-					rgb.forceSetAllDevices(Color.WHITE);
-					sleepCritical(30);
-				}
-				break;
+			case PULSE:
+				return 0.15 + (triangleWave(elapsed, 700) * 0.55);
 
 			default:
-				if (!criticalActive || deathActive)
-				{
-					return;
-				}
-				rgb.forceSetAllDevices(primary);
-				sleepCritical(300);
-				if (!criticalActive || deathActive)
-				{
-					return;
-				}
-				rgb.forceSetAllDevices(secondary);
-				sleepCritical(700);
-				break;
+				return ((elapsed / 120) % 2) == 0 ? 0.65 : 0.25;
 		}
 	}
 
-	private void sleepCritical(long millis) throws InterruptedException
+	private long getEffectDuration(EffectStyle style)
 	{
-		long end = System.currentTimeMillis() + millis;
-
-		while (criticalActive && !deathActive && System.currentTimeMillis() < end)
+		switch (style)
 		{
-			Thread.sleep(Math.min(25, end - System.currentTimeMillis()));
+			case STROBE:
+				return 2000;
+
+			case BREATHING:
+				return 3200;
+
+			case RAINBOW:
+				return 2600;
+
+			case FIRE:
+				return 3600;
+
+			case LIGHTNING:
+				return 3000;
+
+			case PANIC:
+				return 2200;
+
+			case LOOT_SHOWER:
+				return 2600;
+
+			case GRIM_REAPER:
+				return 4200;
+
+			case FLASH:
+			case PULSE:
+			default:
+				return 2600;
 		}
+	}
+
+	private long getOverlayDuration(EffectStyle style)
+	{
+		switch (style)
+		{
+			case STROBE:
+				return 1800;
+
+			case BREATHING:
+			case PULSE:
+				return 2200;
+
+			default:
+				return 1800;
+		}
+	}
+
+	private boolean isCriticalHp()
+	{
+		int hp = client.getBoostedSkillLevel(Skill.HITPOINTS);
+
+		return config.enableCriticalPulse()
+				&& hp > 0
+				&& hp <= config.criticalHpValue();
+	}
+
+	private int getSafeHp()
+	{
+		return Math.max(1, client.getBoostedSkillLevel(Skill.HITPOINTS));
 	}
 
 	private Color getHpColor(int hp)
@@ -1318,6 +901,32 @@ public class OsrgbPlugin extends net.runelite.client.plugins.Plugin
 		}
 
 		return config.criticalHpColor();
+	}
+
+	private Color[] getRainbow()
+	{
+		return new Color[]
+				{
+						new Color(255, 0, 0),
+						new Color(255, 128, 0),
+						new Color(255, 255, 0),
+						new Color(0, 255, 0),
+						new Color(0, 255, 255),
+						new Color(0, 80, 255),
+						new Color(170, 0, 255)
+				};
+	}
+
+	private double triangleWave(long elapsed, long period)
+	{
+		double t = (elapsed % period) / (double) period;
+
+		if (t < 0.5)
+		{
+			return t * 2.0;
+		}
+
+		return 1.0 - ((t - 0.5) * 2.0);
 	}
 
 	private double normalize(double value, double min, double max)
